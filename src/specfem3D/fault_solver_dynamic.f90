@@ -51,9 +51,10 @@ module fault_solver_dynamic
   logical, save                :: SIMULATION_TYPE_DYN = .false.
   logical, save                :: TPV16 = .false.  !TPV16 for heterogeneous in slip weakening
   logical, save                :: TPV10X = .false. !Boundary velocity strengthening layers for TPV10X
-  logical, save                :: TWF = .false.    !Time weakening
+  logical, save                :: TWF = .false.    !Time weakening		
   logical, save                :: RATE_AND_STATE = .false.
   logical, save                :: RSF_HETE = .false.  !RSF_HETE for heterogeneous rate-and-state
+  character(len=MAX_STRING_LEN),save        :: Friction_flag
   real(kind=CUSTOM_REAL), allocatable, save :: Kelvin_Voigt_eta(:)
 
   public :: BC_DYNFLT_init, BC_DYNFLT_set3d_all, Kelvin_Voigt_eta, &
@@ -107,8 +108,8 @@ subroutine BC_DYNFLT_init(prname,DTglobal,myrank)
   integer, parameter            :: IIN_BIN =170
 
   NAMELIST / RUPTURE_SWITCHES / RATE_AND_STATE , TPV16 , TPV10X , RSF_HETE, TWF
-  NAMELIST / BEGIN_FAULT /      dummy_idfault
-
+  NAMELIST / BEGIN_FAULT /        dummy_idfault
+ 
   dummy_idfault = 0
 
   ! note: all processes will open this file
@@ -133,9 +134,8 @@ subroutine BC_DYNFLT_init(prname,DTglobal,myrank)
   endif
   ! WARNING TO DO: should be an MPI abort
 
-  ! Reading etas of each fault
   do iflt = 1,nbfaults
-     read(IIN_PAR,*) ! etas
+     read(IIN_PAR,*)    ! Reading etas of each fault
   enddo
   read(IIN_PAR,*) SIMULATION_TYPE
 
@@ -165,8 +165,29 @@ subroutine BC_DYNFLT_init(prname,DTglobal,myrank)
   allocate( faults(nbfaults) ,stat=ier)
   if (ier /= 0) call exit_MPI_without_rank('error allocating array 1361')
   dt = real(DTglobal)
+
   read(IIN_PAR,nml=RUPTURE_SWITCHES,end=110,iostat=ier)
   if (ier /= 0) write(*,*) 'RUPTURE_SWITCHES not found in Par_file_faults'
+
+
+  if(.not. RATE_AND_STATE .and. .not. TWF) then
+     Friction_flag = 'swf'
+  elseif(.not. RATE_AND_STATE .and. TWF) then
+     Friction_flag = 'twf'
+  elseif(RATE_AND_STATE) then
+     Friction_flag = 'rsf'
+  endif
+  ! Safity check for the input parameters of friction type
+  if (myrank == 0) then
+     if(Friction_flag == 'swf') then
+        write(*,*) 'You are using slip-weakening friction law.'
+     elseif(Friction_flag == 'twf') then
+        write(*,*) 'You are using time-weakening friction law.'
+     elseif(Friction_flag == 'rsf') then
+        write(*,*) 'You are using rate-and-state friction law.'
+     endif
+  endif
+
   do iflt=1,nbfaults
      read(IIN_PAR,nml=BEGIN_FAULT,end=100)
      call init_one_fault(faults(iflt),IIN_BIN,IIN_PAR,dt,nt,iflt,myrank)
@@ -217,25 +238,41 @@ subroutine init_one_fault(bc,IIN_BIN,IIN_PAR,dt,NT,iflt,myrank)
   call initialize_fault(bc,IIN_BIN)
 
   if (bc%nspec > 0) then
+     !  Allocation of arrays
      allocate(bc%T(3,bc%nglob),stat=ier)
      if (ier /= 0) call exit_MPI_without_rank('error allocating array 1363')
      allocate(bc%D(3,bc%nglob),stat=ier)
      if (ier /= 0) call exit_MPI_without_rank('error allocating array 1364')
      allocate(bc%V(3,bc%nglob),stat=ier)
      if (ier /= 0) call exit_MPI_without_rank('error allocating array 1365')
+     allocate(bc%T0(3,bc%nglob),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 1366')
+     allocate(bc%MU(bc%nglob),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 1367')
+
+     select case (Friction_flag)
+     case ('swf')
+        allocate(bc%swf,stat=ier)
+     case ('twf')
+        allocate(bc%swf,stat=ier)
+        allocate(bc%twf,stat=ier)
+     case ('rsf')
+        allocate(bc%rsf,stat=ier)
+     case default
+        stop 'Undefined friction law.'
+     end select
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 1368')
+
+     !  Initialization of of arrays
      bc%T = 0e0_CUSTOM_REAL
      bc%D = 0e0_CUSTOM_REAL
      bc%V = 0e0_CUSTOM_REAL
-
-     ! Set initial fault stresses
-     allocate(bc%T0(3,bc%nglob),stat=ier)
-     if (ier /= 0) call exit_MPI_without_rank('error allocating array 1366')
-     S1 = 0e0_CUSTOM_REAL
-     S2 = 0e0_CUSTOM_REAL
-     S3 = 0e0_CUSTOM_REAL
-     n1 = 0
-     n2 = 0
-     n3 = 0
+     S1   = 0e0_CUSTOM_REAL
+     S2   = 0e0_CUSTOM_REAL
+     S3   = 0e0_CUSTOM_REAL
+     n1   = 0
+     n2   = 0
+     n3   = 0
      read(IIN_PAR, nml=STRESS_TENSOR)
      read(IIN_PAR, nml=INIT_STRESS)
      bc%T0(1,:) = S1
@@ -255,25 +292,22 @@ subroutine init_one_fault(bc,IIN_BIN,IIN_PAR,dt,NT,iflt,myrank)
      bc%T = bc%T0
 
      ! Set friction parameters and initialize friction variables
-     allocate(bc%MU(bc%nglob),stat=ier)
-     if (ier /= 0) call exit_MPI_without_rank('error allocating array 1367')
-     if (RATE_AND_STATE) then
-        allocate(bc%rsf,stat=ier)
-        if (ier /= 0) call exit_MPI_without_rank('error allocating array 1368')
-        call rsf_init(bc%rsf,bc%T0,bc%V,bc%Fload,bc%coord,IIN_PAR)
-     else
-        allocate(bc%swf,stat=ier)
-        if (ier /= 0) call exit_MPI_without_rank('error allocating array 1369')
-        call swf_init(bc%swf,bc%MU,bc%coord,IIN_PAR)
-        if (TPV16) call TPV16_init() !WARNING: ad hoc, initializes T0 and swf
-        if (TWF) then
-           allocate(bc%twf)
-           call twf_init(bc%twf,IIN_PAR)
-        endif
-     endif
+     select case (Friction_flag)
+     case ('swf')
+        call swf_init(bc%swf,bc%MU,bc%coord,IIN_PAR) 
+     case ('twf')
+        call swf_init(bc%swf,bc%MU,bc%coord,IIN_PAR) 
+        call twf_init(bc%twf,IIN_PAR) 
+     case ('rsf')
+        call rsf_init(bc%rsf,bc%T0,bc%V,bc%Fload,bc%coord,IIN_PAR) 
+     case default
+        stop 'Undefined friction law.'
+     end select
+
+     if (Friction_flag /= 'rsf' .and. TPV16) call TPV16_init() !WARNING: ad hoc, initializes T0 and swf
   endif
   !bc%T=bc%T0
-  if (RATE_AND_STATE) then
+  if (Friction_flag == 'rsf') then
      call init_dataT(bc%dataT,bc%coord,bc%nglob,NT,dt,8,iflt)
      if (bc%dataT%npoin > 0) then
      bc%dataT%longFieldNames(8) = "log10 of state variable (log-seconds)"
@@ -572,7 +606,6 @@ subroutine bc_dynflt_set3d_all(F,V,D)
   real(kind=CUSTOM_REAL), dimension(bc%nglob)   :: strength,tStick,tnew, &
                                     theta_old, theta_new, dc, Vf_old, Vf_new, TxExt, tmp_Vf
   real(kind=CUSTOM_REAL) :: half_dt,TLoad,DTau0,GLoad,timeval
-  real(kind=CUSTOM_REAL) :: nuc_x, nuc_y, nuc_z, nuc_r, nuc_t0, nuc_v, dist, tw_r, coh_size
   integer                :: i
 
   if (bc%nspec > 0) then !Surendra : for parallel faults
@@ -604,7 +637,7 @@ subroutine bc_dynflt_set3d_all(F,V,D)
 
      ! smooth loading within nucleation patch
      !WARNING : ad hoc for SCEC benchmark TPV10x
-     if (RATE_AND_STATE) then
+     if (Friction_flag == 'rtf') then
        TxExt = 0._CUSTOM_REAL
        TLoad = 1.0_CUSTOM_REAL
        DTau0 = 1.0_CUSTOM_REAL
@@ -620,7 +653,7 @@ subroutine bc_dynflt_set3d_all(F,V,D)
 
      tStick = sqrt( T(1,:)*T(1,:) + T(2,:)*T(2,:))
 
-     if (.not. RATE_AND_STATE) then   ! Update slip weakening friction:
+     if (Friction_flag == 'swf' .or. Friction_flag == 'twf') then   ! Update slip weakening friction:
        ! Update slip state variable
        ! WARNING: during opening the friction state variable should not evolve
        theta_old = bc%swf%theta
@@ -630,26 +663,8 @@ subroutine bc_dynflt_set3d_all(F,V,D)
        bc%MU = swf_mu(bc%swf)
 
        ! combined with time-weakening for nucleation
-       if (TWF) then
-          timeval = it*bc%dt
-          nuc_x   = bc%twf%nuc_x
-          nuc_y   = bc%twf%nuc_y
-          nuc_z   = bc%twf%nuc_z
-          nuc_r   = bc%twf%nuc_r
-          nuc_t0  = bc%twf%nuc_t0
-          nuc_v   = bc%twf%nuc_v
-          do i=1,bc%nglob
-             dist = ((bc%coord(1,i)-nuc_x)**2 + (bc%coord(2,i)-nuc_y)**2 + (bc%coord(3,i)-nuc_z)**2)**0.5
-             if (dist <= nuc_r) then
-                tw_r     = timeval * nuc_v
-                coh_size = nuc_t0  * nuc_v
-                if (dist <= tw_r - coh_size) then
-                   bc%MU(i) = min(bc%MU(i), bc%swf%mud(i))
-                else if (dist > tw_r - coh_size .and. dist <= tw_r ) then
-                   bc%MU(i) = min(bc%MU(i), bc%swf%mud(i) + (dist-(tw_r-coh_size))/coh_size*(bc%swf%mus(i)-bc%swf%mud(i)))
-                endif
-             endif
-          enddo
+       if (Friction_flag == 'twf') then
+           bc%MU = twf_mu(bc,it)
        endif
 
        if (TPV16) then
@@ -694,7 +709,7 @@ subroutine bc_dynflt_set3d_all(F,V,D)
      ! Subtract initial stress
      T = T - bc%T0
 
-     if (RATE_AND_STATE) T(1,:) = T(1,:) - TxExt
+     if (Friction_flag == 'rsf') T(1,:) = T(1,:) - TxExt
      !JPA: this eliminates the effect of TxExt on the equations of motion. Why is it needed?
 
      ! Update slip acceleration da=da_free-T/(0.5*dt*Z)
@@ -713,7 +728,7 @@ subroutine bc_dynflt_set3d_all(F,V,D)
      call add_BT(bc,MxA,T)
      !-- intermediate storage of outputs --
      Vf_new = sqrt(bc%V(1,:)*bc%V(1,:)+bc%V(2,:)*bc%V(2,:))
-     if (.not. RATE_AND_STATE) then
+     if (Friction_flag == 'swf' .or. Friction_flag == 'twf') then
         theta_new = bc%swf%theta
         dc        = bc%swf%dc
      else
@@ -725,7 +740,7 @@ subroutine bc_dynflt_set3d_all(F,V,D)
           Vf_old, Vf_new, it*bc%dt,bc%dt)
 
      call store_dataT(bc%dataT,bc%D,bc%V,bc%T,it)
-     if (RATE_AND_STATE) then
+     if (Friction_flag == 'rsf') then
         if (bc%rsf%StateLaw == 1) then
            bc%dataT%dat(8,:,it) = log10(theta_new(bc%dataT%iglob))
         else
@@ -891,11 +906,15 @@ end function swf_mu
 ! Time weakening friction law (accompanied with slip-weakening friction)
 !
 ! It contains one subtoutine: twf_init
-! and one function:           twf_mu  (will add soon)
+! and one function:           twf_mu  
 ! 
 ! twf_init
 !     input: 
 !            f, IIN_PAR
+!
+! twf_mu
+!     input:
+!            bc, it
 !
 !=====================================================================
 
@@ -927,6 +946,41 @@ subroutine twf_init(f,IIN_PAR)
   f%nuc_v  = nuc_v
 
 end subroutine twf_init
+
+!-------------
+
+function twf_mu(bc,it) result(mu)
+
+  implicit none
+
+  type(bc_dynandkinflt_type), intent(in) :: bc
+  integer, intent(in)    :: it
+  real(kind=CUSTOM_REAL) :: mu(size(bc%MU))
+  real(kind=CUSTOM_REAL) :: nuc_x, nuc_y, nuc_z, nuc_r, nuc_t0, nuc_v, dist, tw_r, coh_size
+  real(kind=CUSTOM_REAL) :: timeval
+  integer                :: i
+
+  timeval = it * bc%dt
+  nuc_x   = bc%twf%nuc_x
+  nuc_y   = bc%twf%nuc_y
+  nuc_z   = bc%twf%nuc_z
+  nuc_r   = bc%twf%nuc_r
+  nuc_t0  = bc%twf%nuc_t0
+  nuc_v   = bc%twf%nuc_v
+  do i=1,size(bc%MU)
+     dist = ((bc%coord(1,i)-nuc_x)**2 + (bc%coord(2,i)-nuc_y)**2 + (bc%coord(3,i)-nuc_z)**2)**0.5
+     if (dist <= nuc_r) then
+        tw_r     = timeval * nuc_v
+        coh_size = nuc_t0  * nuc_v
+        if (dist <= tw_r - coh_size) then
+           mu(i) = min(bc%MU(i), bc%swf%mud(i))
+        else if (dist > tw_r - coh_size .and. dist <= tw_r ) then
+           mu(i) = min(bc%MU(i), bc%swf%mud(i) + (dist-(tw_r-coh_size))/coh_size*(bc%swf%mus(i)-bc%swf%mud(i)))
+        endif
+     endif
+  enddo
+
+end function twf_mu
 
 !-------------
 
@@ -984,8 +1038,6 @@ subroutine rsf_init(f,T0,V,nucFload,coord,IIN_PAR)
   NAMELIST / ASP / Fload,nFload
 
   nglob = size(coord,2)
-
-  f%StateLaw = InputStateLaw
 
   allocate( f%V0(nglob) ,stat=ier)
   if (ier /= 0) call exit_MPI_without_rank('error allocating array 1376')
@@ -1047,6 +1099,7 @@ subroutine rsf_init(f,T0,V,nucFload,coord,IIN_PAR)
   f%T      = T
   f%fw     = fw
   f%Vw     = Vw
+  f%StateLaw = InputStateLaw
 
   call init_2d_distribution(f%V0,coord,IIN_PAR,nV0)
   call init_2d_distribution(f%f0,coord,IIN_PAR,nf0)
@@ -1443,7 +1496,7 @@ subroutine init_dataXZ(dataXZ,bc)
   if (bc%nglob > 0) then
      allocate(dataXZ%stg(bc%nglob),stat=ier)
      if (ier /= 0) call exit_MPI_without_rank('error allocating array 1401')
-     if (.not. RATE_AND_STATE) then
+     if (Friction_flag == 'swf' .or. Friction_flag == 'twf') then
         dataXZ%sta => bc%swf%theta
      else
         dataXZ%sta => bc%rsf%theta
