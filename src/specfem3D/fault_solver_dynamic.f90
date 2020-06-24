@@ -1327,7 +1327,11 @@ subroutine rsf_init(f,T0,V,nucFload,coord,IIN_PAR)
      where(V /= 0._CUSTOM_REAL)
         fLV = f%f0 - (f%b - f%a)*log(V/f%V0)
         f_ss = f%fw + (fLV - f%fw)/(ONE + (V/f%Vw)**8)**0.125
-        xi_ss = f%a * log( TWO*f%V0/V * sinh(f_ss/f%a) )
+        where(f_ss/f%a > 40._CUSTOM_REAL)
+           xi_ss = f%a * (log(TWO*f%V0/V/TWO) + f_ss/f%a )
+        elsewhere
+           xi_ss = f%a * log( TWO*f%V0/V * sinh(f_ss/f%a) )
+        endwhere
         f%theta = xi_ss + (f%theta - xi_ss) * exp(-vDtL)
      elsewhere
         f%theta = f%theta
