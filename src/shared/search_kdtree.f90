@@ -747,9 +747,11 @@ contains
     if (points_data(idim,iloc) < cut_value) then
       ilower = ilower + 1
       workindex(ilower) = iloc
+      if(ilower>size(workindex) .or. ilower==0) write(*,*) "workindex is out of bound",ilower
     else
       iupper = iupper + 1
       workindex(ibound_upper - ibound_lower + 2 - iupper) = iloc
+      if(ibound_upper - ibound_lower + 2 - iupper>size(workindex) .or. ibound_upper - ibound_lower + 2 - iupper==0)write(*,*) "workindex is out of bound",ibound_upper - ibound_lower + 2 - iupper
     endif
   enddo
   !debug
