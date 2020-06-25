@@ -54,7 +54,6 @@ module fault_solver_dynamic
   logical, save                :: TWF = .false.    !Time weakening		
   logical, save                :: RATE_AND_STATE = .false.
   logical, save                :: RSF_HETE = .false.  !RSF_HETE for heterogeneous rate-and-state
-  character(len=MAX_STRING_LEN),save        :: Friction_flag
   real(kind=CUSTOM_REAL), allocatable, save :: Kelvin_Voigt_eta(:)
 
   public :: BC_DYNFLT_init, BC_DYNFLT_set3d_all, Kelvin_Voigt_eta, &
@@ -169,25 +168,6 @@ subroutine BC_DYNFLT_init(prname,DTglobal,myrank)
   read(IIN_PAR,nml=RUPTURE_SWITCHES,end=110,iostat=ier)
   if (ier /= 0) write(*,*) 'RUPTURE_SWITCHES not found in Par_file_faults'
 
-
-  if(.not. RATE_AND_STATE .and. .not. TWF) then
-     Friction_flag = 'swf'
-  elseif(.not. RATE_AND_STATE .and. TWF) then
-     Friction_flag = 'twf'
-  elseif(RATE_AND_STATE) then
-     Friction_flag = 'rsf'
-  endif
-  ! Safity check for the input parameters of friction type
-  if (myrank == 0) then
-     if(Friction_flag == 'swf') then
-        write(*,*) 'You are using slip-weakening friction law.'
-     elseif(Friction_flag == 'twf') then
-        write(*,*) 'You are using time-weakening friction law.'
-     elseif(Friction_flag == 'rsf') then
-        write(*,*) 'You are using rate-and-state friction law.'
-     endif
-  endif
-
   do iflt=1,nbfaults
      read(IIN_PAR,nml=BEGIN_FAULT,end=100)
      call init_one_fault(faults(iflt),IIN_BIN,IIN_PAR,dt,nt,iflt,myrank)
@@ -250,20 +230,22 @@ subroutine init_one_fault(bc,IIN_BIN,IIN_PAR,dt,NT,iflt,myrank)
      allocate(bc%MU(bc%nglob),stat=ier)
      if (ier /= 0) call exit_MPI_without_rank('error allocating array 1367')
 
-     select case (Friction_flag)
-     case ('swf')
+     if(.not. RATE_AND_STATE .and. .not. TWF) then
+        if (myrank == 0) write(*,*) 'Using slip-weakening friction law.'
         allocate(bc%swf,stat=ier)
-     case ('twf')
+
+     else if(.not. RATE_AND_STATE .and. TWF) then
+        if (myrank == 0) write(*,*) 'Using time-weakening friction law.'
         allocate(bc%swf,stat=ier)
         allocate(bc%twf,stat=ier)
-     case ('rsf')
+
+     else if(RATE_AND_STATE) then
+        if (myrank == 0) write(*,*) 'Using rate-and-state friction law.'
         allocate(bc%rsf,stat=ier)
-     case default
-        stop 'Undefined friction law.'
-     end select
+     endif
      if (ier /= 0) call exit_MPI_without_rank('error allocating array 1368')
 
-     !  Initialization of of arrays
+     !  Initialization of arrays
      bc%T = 0e0_CUSTOM_REAL
      bc%D = 0e0_CUSTOM_REAL
      bc%V = 0e0_CUSTOM_REAL
@@ -284,30 +266,34 @@ subroutine init_one_fault(bc,IIN_BIN,IIN_PAR,dt,NT,iflt,myrank)
         call load_stress_drop
      endif
 
-     call init_2d_distribution(bc%T0(1,:),bc%coord,IIN_PAR,n1)
-     call init_2d_distribution(bc%T0(2,:),bc%coord,IIN_PAR,n2)
-     call init_2d_distribution(bc%T0(3,:),bc%coord,IIN_PAR,n3)
+     call init_2d_distribution(bc%T0(1,:),bc%coord,IIN_PAR,n1,'T0_1')
+     call init_2d_distribution(bc%T0(2,:),bc%coord,IIN_PAR,n2,'T0_1')
+     call init_2d_distribution(bc%T0(3,:),bc%coord,IIN_PAR,n3,'T0_1')
      call init_fault_traction(bc,Sigma) !added the fault traction caused by a regional stress field
 
      bc%T = bc%T0
 
      ! Set friction parameters and initialize friction variables
-     select case (Friction_flag)
-     case ('swf')
+     if(.not. RATE_AND_STATE .and. .not. TWF) then
         call swf_init(bc%swf,bc%MU,bc%coord,IIN_PAR) 
-     case ('twf')
+
+     else if(.not. RATE_AND_STATE .and. TWF) then
         call swf_init(bc%swf,bc%MU,bc%coord,IIN_PAR) 
         call twf_init(bc%twf,IIN_PAR) 
-     case ('rsf')
-        call rsf_init(bc%rsf,bc%T0,bc%V,bc%Fload,bc%coord,IIN_PAR) 
-     case default
-        stop 'Undefined friction law.'
-     end select
 
-     if (Friction_flag /= 'rsf' .and. TPV16) call TPV16_init() !WARNING: ad hoc, initializes T0 and swf
+     else if(RATE_AND_STATE) then
+        call rsf_init(bc%rsf,bc%T0,bc%V,bc%Fload,bc%coord,IIN_PAR) 
+        if(bc%rsf%StateLaw==1) then
+            if (myrank == 0) write(*,*) 'Using the aging law'
+        else if(bc%rsf%StateLaw==2) then
+            if (myrank == 0) write(*,*) 'Using the slip law with strong weakening'
+        endif
+     endif
+
+     if (.not. RATE_AND_STATE .and. TPV16) call TPV16_init() !WARNING: ad hoc, initializes T0 and swf
   endif
   !bc%T=bc%T0
-  if (Friction_flag == 'rsf') then
+  if (RATE_AND_STATE) then
      call init_dataT(bc%dataT,bc%coord,bc%nglob,NT,dt,8,iflt)
      if (bc%dataT%npoin > 0) then
      bc%dataT%longFieldNames(8) = "log10 of state variable (log-seconds)"
@@ -423,22 +409,27 @@ end subroutine init_one_fault
 ! JPA refactor: background value should be an argument
 !---------------------------------------------------------------------
 
-subroutine init_2d_distribution(a,coord,iin,n)
+subroutine init_2d_distribution(a,coord,iin,n,label)
 
+  use constants, only: IN_DATA_FILES
+  use specfem_par, only: myrank
   implicit none
 
   real(kind=CUSTOM_REAL), intent(inout) :: a(:)
   real(kind=CUSTOM_REAL), intent(in)    :: coord(:,:)
+  character(len=*),intent(in)           :: label
   integer, intent(in)                   :: iin,n
   real(kind=CUSTOM_REAL)                :: b(size(a))
-  character(len=MAX_STRING_LEN)         :: shapeval
+  character(len=MAX_STRING_LEN)         :: shapeval, filename
   real(kind=CUSTOM_REAL)                :: val,valh, xc, yc, zc, r, rc, l, lx,ly,lz
   real(kind=CUSTOM_REAL)                :: r1(size(a))
   real(kind=CUSTOM_REAL)                :: tmp1(size(a)),tmp2(size(a)),tmp3(size(a))
-  integer                :: i
-  real(kind=CUSTOM_REAL) :: SMALLVAL
+  integer                :: i, ipar, jpar,  num_lines
+  real(kind=CUSTOM_REAL) :: SMALLVAL, dist, temp
+  real(kind=CUSTOM_REAL), allocatable :: xyzv(:,:) ! data from the input file
 
-  NAMELIST / DIST2D / shapeval, val,valh, xc, yc, zc, r, rc, l, lx,ly,lz
+  NAMELIST / DIST2D / shapeval, val,valh, xc, yc, zc, r, rc, l, lx,ly,lz,filename
+
 
   SMALLVAL = 1.e-10_CUSTOM_REAL
 
@@ -446,6 +437,7 @@ subroutine init_2d_distribution(a,coord,iin,n)
 
   do i=1,n
      shapeval = ''
+     filename = ''
      val  = 0e0_CUSTOM_REAL
      valh = 0e0_CUSTOM_REAL
      xc   = 0e0_CUSTOM_REAL
@@ -522,6 +514,25 @@ subroutine init_2d_distribution(a,coord,iin,n)
        b     = heaviside( tmp1 ) * heaviside( tmp2 ) * heaviside( tmp3 ) &
                * (val + ( coord(3,:) - zc + lz/2._CUSTOM_REAL ) * (valh-val)/lz )
 
+     case ('read-from-file')
+        if (filename == "") then
+           stop 'read-from-file option is chosen, but filename is empty.'
+        else
+           if (myrank == 0) write(*,*) 'Parameter ',trim(label),' was read from file: ',trim(filename)
+        endif
+        call read_para_file(xyzv,filename)
+        num_lines = size(xyzv(1,:))
+        ! find the nearest point
+        do ipar=1,size(b)
+           temp = huge(temp)
+           do jpar=1,num_lines
+              dist=sqrt((coord(1,ipar)-xyzv(1,jpar))**2+(coord(2,ipar)-xyzv(2,jpar))**2+(coord(3,ipar)-xyzv(3,jpar))**2)
+              if(temp<dist) then
+                 b(ipar) = xyzv(4,jpar)
+              endif
+           enddo
+        enddo
+
      case default
         stop 'bc_dynflt_3d::init_2d_distribution:: unknown shape'
      end select
@@ -531,6 +542,28 @@ subroutine init_2d_distribution(a,coord,iin,n)
   enddo
 
 end subroutine init_2d_distribution
+
+!--------------
+
+subroutine read_para_file(xyzv,filename)
+
+  implicit none
+
+  real(kind=CUSTOM_REAL), allocatable, intent(inout) :: xyzv(:,:) ! data from the input file
+  character(len=MAX_STRING_LEN), intent(in)          :: filename
+  integer   :: num_lines, i, ier
+  integer   :: IIN_2D = 300
+
+  open(unit=IIN_2D,file=IN_DATA_FILES(1:len_trim(IN_DATA_FILES))//trim(filename),status='old',iostat=ier)
+
+  read(IIN_2D,*) num_lines
+  allocate(xyzv(4,num_lines))
+  do i=1,num_lines
+     read(IIN_2D,*) xyzv(1,i),xyzv(2,i),xyzv(3,i),xyzv(4,i)
+  enddo
+  close(IIN_2D)
+
+end subroutine read_para_file
 
 !---------------------------------------------------------------------
 !init_fault_traction subroutine computes the traction on the fault plane
@@ -637,7 +670,7 @@ subroutine bc_dynflt_set3d_all(F,V,D)
 
      ! smooth loading within nucleation patch
      !WARNING : ad hoc for SCEC benchmark TPV10x
-     if (Friction_flag == 'rtf') then
+     if (RATE_AND_STATE) then
        TxExt = 0._CUSTOM_REAL
        TLoad = 1.0_CUSTOM_REAL
        DTau0 = 1.0_CUSTOM_REAL
@@ -653,7 +686,7 @@ subroutine bc_dynflt_set3d_all(F,V,D)
 
      tStick = sqrt( T(1,:)*T(1,:) + T(2,:)*T(2,:))
 
-     if (Friction_flag == 'swf' .or. Friction_flag == 'twf') then   ! Update slip weakening friction:
+     if (.not. RATE_AND_STATE) then   ! Update slip weakening friction:
        ! Update slip state variable
        ! WARNING: during opening the friction state variable should not evolve
        theta_old = bc%swf%theta
@@ -663,7 +696,7 @@ subroutine bc_dynflt_set3d_all(F,V,D)
        bc%MU = swf_mu(bc%swf)
 
        ! combined with time-weakening for nucleation
-       if (Friction_flag == 'twf') then
+       if (.not. RATE_AND_STATE .and. TWF) then
            bc%MU = twf_mu(bc,it)
        endif
 
@@ -709,7 +742,7 @@ subroutine bc_dynflt_set3d_all(F,V,D)
      ! Subtract initial stress
      T = T - bc%T0
 
-     if (Friction_flag == 'rsf') T(1,:) = T(1,:) - TxExt
+     if (RATE_AND_STATE) T(1,:) = T(1,:) - TxExt
      !JPA: this eliminates the effect of TxExt on the equations of motion. Why is it needed?
 
      ! Update slip acceleration da=da_free-T/(0.5*dt*Z)
@@ -728,7 +761,7 @@ subroutine bc_dynflt_set3d_all(F,V,D)
      call add_BT(bc,MxA,T)
      !-- intermediate storage of outputs --
      Vf_new = sqrt(bc%V(1,:)*bc%V(1,:)+bc%V(2,:)*bc%V(2,:))
-     if (Friction_flag == 'swf' .or. Friction_flag == 'twf') then
+     if (.not. RATE_AND_STATE) then
         theta_new = bc%swf%theta
         dc        = bc%swf%dc
      else
@@ -740,7 +773,7 @@ subroutine bc_dynflt_set3d_all(F,V,D)
           Vf_old, Vf_new, it*bc%dt,bc%dt)
 
      call store_dataT(bc%dataT,bc%D,bc%V,bc%T,it)
-     if (Friction_flag == 'rsf') then
+     if (RATE_AND_STATE) then
         if (bc%rsf%StateLaw == 1) then
            bc%dataT%dat(8,:,it) = log10(theta_new(bc%dataT%iglob))
         else
@@ -848,11 +881,11 @@ subroutine swf_init(f,mu,coord,IIN_PAR)
   f%C        = C
   f%T        = T
   f%theta    = 0e0_CUSTOM_REAL
-  call init_2d_distribution(f%mus,coord,IIN_PAR,nmus)
-  call init_2d_distribution(f%mud,coord,IIN_PAR,nmud)
-  call init_2d_distribution(f%Dc ,coord,IIN_PAR,ndc)
-  call init_2d_distribution(f%C  ,coord,IIN_PAR,nC)
-  call init_2d_distribution(f%T  ,coord,IIN_PAR,nForcedRup)
+  call init_2d_distribution(f%mus,coord,IIN_PAR,nmus,      'mus')
+  call init_2d_distribution(f%mud,coord,IIN_PAR,nmud,      'mud')
+  call init_2d_distribution(f%Dc ,coord,IIN_PAR,ndc,       'Dc')
+  call init_2d_distribution(f%C  ,coord,IIN_PAR,nC,        'C')
+  call init_2d_distribution(f%T  ,coord,IIN_PAR,nForcedRup,'T')
 
   mu = swf_mu(f)
 
@@ -1033,6 +1066,7 @@ subroutine rsf_init(f,T0,V,nucFload,coord,IIN_PAR)
   integer                :: nFload
   integer                :: nglob,ier
   integer                :: InputStateLaw = 1 ! By default using aging law
+  !character(len=MAX_STRING_LEN) :: label
 
   NAMELIST / RSF / V0,f0,a,b,L,V_init,theta_init,nV0,nf0,na,nb,nL,nV_init,ntheta_init,C,T,nC,nForcedRup,Vw,fw,nVw,nfw,InputStateLaw
   NAMELIST / ASP / Fload,nFload
@@ -1101,17 +1135,17 @@ subroutine rsf_init(f,T0,V,nucFload,coord,IIN_PAR)
   f%Vw     = Vw
   f%StateLaw = InputStateLaw
 
-  call init_2d_distribution(f%V0,coord,IIN_PAR,nV0)
-  call init_2d_distribution(f%f0,coord,IIN_PAR,nf0)
-  call init_2d_distribution(f%a,coord,IIN_PAR,na)
-  call init_2d_distribution(f%b,coord,IIN_PAR,nb)
-  call init_2d_distribution(f%L,coord,IIN_PAR,nL)
-  call init_2d_distribution(f%V_init,coord,IIN_PAR,nV_init)
-  call init_2d_distribution(f%theta,coord,IIN_PAR,ntheta_init)
-  call init_2d_distribution(f%C,coord,IIN_PAR,nC)
-  call init_2d_distribution(f%T,coord,IIN_PAR,nForcedRup)
-  call init_2d_distribution(f%fw,coord,IIN_PAR,nfw)
-  call init_2d_distribution(f%Vw,coord,IIN_PAR,nVw)
+  call init_2d_distribution(f%V0,coord,IIN_PAR,nV0,'V0')
+  call init_2d_distribution(f%f0,coord,IIN_PAR,nf0,'f0')
+  call init_2d_distribution(f%a,coord,IIN_PAR,na,  'a')
+  call init_2d_distribution(f%b,coord,IIN_PAR,nb,  'b')
+  call init_2d_distribution(f%L,coord,IIN_PAR,nL,  'L')
+  call init_2d_distribution(f%V_init,coord,IIN_PAR,nV_init,   'V_init')
+  call init_2d_distribution(f%theta,coord,IIN_PAR,ntheta_init,'theta')
+  call init_2d_distribution(f%C,coord,IIN_PAR,nC,             'C')
+  call init_2d_distribution(f%T,coord,IIN_PAR,nForcedRup,     'T')
+  call init_2d_distribution(f%fw,coord,IIN_PAR,nfw,           'fw')
+  call init_2d_distribution(f%Vw,coord,IIN_PAR,nVw,           'Vw')
 
   ! WARNING: The line below scratches an earlier initialization of theta through theta_init
   !          We should implement it as an option for the user
@@ -1131,7 +1165,7 @@ subroutine rsf_init(f,T0,V,nucFload,coord,IIN_PAR)
   nFload   = 0
   read(IIN_PAR, nml=ASP)
   nucFload = Fload
-  call init_2d_distribution(nucFload,coord,IIN_PAR,nFload)
+  call init_2d_distribution(nucFload,coord,IIN_PAR,nFload,'nucFload')
 
   ! WARNING: the line below is only valid for pure strike-slip faulting
   V(1,:) = f%V_init
@@ -1500,7 +1534,7 @@ subroutine init_dataXZ(dataXZ,bc)
   if (bc%nglob > 0) then
      allocate(dataXZ%stg(bc%nglob),stat=ier)
      if (ier /= 0) call exit_MPI_without_rank('error allocating array 1401')
-     if (Friction_flag == 'swf' .or. Friction_flag == 'twf') then
+     if (.not. RATE_AND_STATE) then
         dataXZ%sta => bc%swf%theta
      else
         dataXZ%sta => bc%rsf%theta
