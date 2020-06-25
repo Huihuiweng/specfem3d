@@ -52,7 +52,8 @@ module fault_solver_dynamic
   logical, save                :: TPV16 = .false.  !TPV16 for heterogeneous in slip weakening
   logical, save                :: TPV10X = .false. !Boundary velocity strengthening layers for TPV10X
   logical, save                :: TWF = .false.    !Time weakening		
-  logical, save                :: RATE_AND_STATE = .false.
+  logical, save                :: RATE_AND_STATE   = .false.
+  logical, save                :: PRINT_FAULT_INFO = .false. ! print the input fault parameters
   logical, save                :: RSF_HETE = .false.  !RSF_HETE for heterogeneous rate-and-state
   real(kind=CUSTOM_REAL), allocatable, save :: Kelvin_Voigt_eta(:)
 
@@ -106,7 +107,7 @@ subroutine BC_DYNFLT_init(prname,DTglobal,myrank)
   integer, parameter            :: IIN_PAR =151
   integer, parameter            :: IIN_BIN =170
 
-  NAMELIST / RUPTURE_SWITCHES / RATE_AND_STATE , TPV16 , TPV10X , RSF_HETE, TWF
+  NAMELIST / RUPTURE_SWITCHES / RATE_AND_STATE , TPV16 , TPV10X , RSF_HETE, TWF, PRINT_FAULT_INFO
   NAMELIST / BEGIN_FAULT /        dummy_idfault
  
   dummy_idfault = 0
@@ -168,12 +169,36 @@ subroutine BC_DYNFLT_init(prname,DTglobal,myrank)
   read(IIN_PAR,nml=RUPTURE_SWITCHES,end=110,iostat=ier)
   if (ier /= 0) write(*,*) 'RUPTURE_SWITCHES not found in Par_file_faults'
 
+  if(.not. RATE_AND_STATE .and. .not. TWF) then
+     if (myrank == 0) write(*,*) '   Using slip-weakening friction law.'
+
+  else if(.not. RATE_AND_STATE .and. TWF) then
+     if (myrank == 0) write(*,*) '   Using time-weakening friction law.'
+
+  else if(RATE_AND_STATE) then
+     if (myrank == 0) write(*,*) '   Using rate-and-state friction law.'
+  endif
+  if (myrank == 0) write(*,*)  ' '
+
   do iflt=1,nbfaults
      read(IIN_PAR,nml=BEGIN_FAULT,end=100)
      call init_one_fault(faults(iflt),IIN_BIN,IIN_PAR,dt,nt,iflt,myrank)
   enddo
   close(IIN_BIN)
   close(IIN_PAR)
+
+  if(RATE_AND_STATE) then
+     if(faults(1)%nspec>0) then
+         if (faults(1)%rsf%StateLaw==1) write(*,*) '     Using the aging law'
+         if (faults(1)%rsf%StateLaw==2) write(*,*) '     Using the slip law with strong weakening'
+     endif
+  endif
+
+  if(PRINT_FAULT_INFO) then
+     do iflt=1,nbfaults
+        call Write_input_fault_info(faults(iflt),iflt)
+     enddo 
+  endif
 
   filename = prname(1:len_trim(prname))//'Kelvin_voigt_eta.bin'
   open(unit=IIN_BIN,file=trim(filename),status='old',action='read',form='unformatted',iostat=ier)
@@ -231,16 +256,13 @@ subroutine init_one_fault(bc,IIN_BIN,IIN_PAR,dt,NT,iflt,myrank)
      if (ier /= 0) call exit_MPI_without_rank('error allocating array 1367')
 
      if(.not. RATE_AND_STATE .and. .not. TWF) then
-        if (myrank == 0) write(*,*) 'Using slip-weakening friction law.'
         allocate(bc%swf,stat=ier)
 
      else if(.not. RATE_AND_STATE .and. TWF) then
-        if (myrank == 0) write(*,*) 'Using time-weakening friction law.'
         allocate(bc%swf,stat=ier)
         allocate(bc%twf,stat=ier)
 
      else if(RATE_AND_STATE) then
-        if (myrank == 0) write(*,*) 'Using rate-and-state friction law.'
         allocate(bc%rsf,stat=ier)
      endif
      if (ier /= 0) call exit_MPI_without_rank('error allocating array 1368')
@@ -267,8 +289,8 @@ subroutine init_one_fault(bc,IIN_BIN,IIN_PAR,dt,NT,iflt,myrank)
      endif
 
      call init_2d_distribution(bc%T0(1,:),bc%coord,IIN_PAR,n1,'T0_1')
-     call init_2d_distribution(bc%T0(2,:),bc%coord,IIN_PAR,n2,'T0_1')
-     call init_2d_distribution(bc%T0(3,:),bc%coord,IIN_PAR,n3,'T0_1')
+     call init_2d_distribution(bc%T0(2,:),bc%coord,IIN_PAR,n2,'T0_2')
+     call init_2d_distribution(bc%T0(3,:),bc%coord,IIN_PAR,n3,'T0_3')
      call init_fault_traction(bc,Sigma) !added the fault traction caused by a regional stress field
 
      bc%T = bc%T0
@@ -283,11 +305,6 @@ subroutine init_one_fault(bc,IIN_BIN,IIN_PAR,dt,NT,iflt,myrank)
 
      else if(RATE_AND_STATE) then
         call rsf_init(bc%rsf,bc%T0,bc%V,bc%Fload,bc%coord,IIN_PAR) 
-        if(bc%rsf%StateLaw==1) then
-            if (myrank == 0) write(*,*) 'Using the aging law'
-        else if(bc%rsf%StateLaw==2) then
-            if (myrank == 0) write(*,*) 'Using the slip law with strong weakening'
-        endif
      endif
 
      if (.not. RATE_AND_STATE .and. TPV16) call TPV16_init() !WARNING: ad hoc, initializes T0 and swf
@@ -518,7 +535,7 @@ subroutine init_2d_distribution(a,coord,iin,n,label)
         if (filename == "") then
            stop 'read-from-file option is chosen, but filename is empty.'
         else
-           if (myrank == 0) write(*,*) 'Parameter ',trim(label),' was read from file: ',trim(filename)
+           if (myrank == 0) write(*,*) '   Parameter ',trim(label),' was input from file: ',trim(filename)
         endif
         call read_para_file(xyzv,filename)
         num_lines = size(xyzv(1,:))
@@ -527,8 +544,9 @@ subroutine init_2d_distribution(a,coord,iin,n,label)
            temp = huge(temp)
            do jpar=1,num_lines
               dist=sqrt((coord(1,ipar)-xyzv(1,jpar))**2+(coord(2,ipar)-xyzv(2,jpar))**2+(coord(3,ipar)-xyzv(3,jpar))**2)
-              if(temp<dist) then
-                 b(ipar) = xyzv(4,jpar)
+              if(dist<temp) then
+                 b(ipar) = xyzv(4,jpar) 
+                 temp    = dist
               endif
            enddo
         enddo
@@ -1462,6 +1480,9 @@ subroutine rsf_init(f,T0,V,nucFload,coord,IIN_PAR)
 !=====================================================================
 !   Subtourines for output listed:
 !
+!   Write_input_fault_info
+!      input: bc,fault_ID
+!
 !   SCEC_Write_RuptureTime
 !      input: dataXZ, iflt
 !
@@ -1477,6 +1498,231 @@ subroutine rsf_init(f,T0,V,nucFload,coord,IIN_PAR)
 !   write_dataXZ
 !      input: dataXZ, itime, iflt
 !-------------------------------------------------------------------------------------------------
+
+subroutine Write_input_fault_info(bc,fault_ID)
+
+  use specfem_par, only: OUTPUT_FILES, NPROC, myrank
+  implicit none
+
+  type(bc_dynandkinflt_type),intent(in) :: bc
+  integer,intent(in)                    :: fault_ID
+  integer                               :: i, ier, iproc, IOUT, npoin_all, npoin
+  character(len=MAX_STRING_LEN)         :: filename
+  integer, allocatable                  :: npoin_perproc(:), poin_offset(:)
+  real(kind=CUSTOM_REAL), allocatable   :: X(:), Y(:), Z(:),          &
+                                           data1(:),data2(:),data3(:),&
+                                           data4(:),data5(:),data6(:),&
+                                           data7(:),data8(:),data9(:),&
+                                           data10(:), data11(:), data12(:),&
+                                           data13(:)
+  real(kind=CUSTOM_REAL), allocatable   :: X_all(:),    Y_all(:),    Z_all(:),    &
+                                           data1_all(:),data2_all(:),data3_all(:),&
+                                           data4_all(:),data5_all(:),data6_all(:),&
+                                           data7_all(:),data8_all(:),data9_all(:),&
+                                           data10_all(:),data11_all(:),data12_all(:),&
+                                           data13_all(:)
+
+  npoin = bc%nglob
+
+  write(filename,'(a,I0)') trim(OUTPUT_FILES)//'/fault_input_info-', fault_ID
+  IOUT = 301
+
+  ! Not parallel simulation
+  if (.not. PARALLEL_FAULT .or.  NPROC == 1 ) then
+     if(.not. RATE_AND_STATE) then
+        open(IOUT,file=trim(filename),status='replace')
+        write(*,*) '   Write fault input data: slip-weakening/time-weakening friction.'
+        write(IOUT,*) 'X Y Z mus mud Dc Tau1 Tau2 Tau3'
+        do i=1,size(bc%MU)
+           write(IOUT,'(9(E15.7))') bc%coord(1,i), bc%coord(2,i), bc%coord(3,i),&
+                                    bc%swf%mus(i), bc%swf%mud(i), bc%swf%Dc(i), &
+                                    bc%T0(1,i),    bc%T0(2,i),    bc%T0(3,i)
+        enddo
+
+     else if(RATE_AND_STATE) then
+        open(IOUT,file=trim(filename),status='replace')
+        write(*,*) '   Write fault input data: rate-and-state friction.'
+        write(IOUT,*) 'X Y Z V0 f0 a b L V_init theta fw Vw Tau1 Tau2 Tau3'
+        do i=1,size(bc%MU)
+           write(IOUT,'(14(E15.7))')bc%coord(1,i),  bc%coord(2,i), bc%coord(3,i),&
+                                    bc%rsf%V0(i),   bc%rsf%f0(i),  bc%rsf%a(i),  &
+                                    bc%rsf%b(i),    bc%rsf%L(i),   bc%rsf%V_init(i),&
+                                    bc%rsf%theta(i),bc%rsf%fw(i),   bc%rsf%Vw(i), &
+                                    bc%T0(1,i),     bc%T0(2,i),    bc%T0(3,i)
+        enddo
+     endif
+     close(IOUT)
+     return
+  endif
+
+
+  ! Parallel simulation
+  if (bc%nglob > 0) then
+     allocate(X(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(Y(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(Z(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data1(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data2(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data3(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data4(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data5(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data6(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data7(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data8(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data9(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data10(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data11(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data12(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data13(npoin),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+
+     X = bc%coord(1,:) 
+     Y = bc%coord(2,:) 
+     Z = bc%coord(3,:) 
+     if(.not. RATE_AND_STATE) then
+        data1 = bc%swf%mus
+        data2 = bc%swf%mud
+        data3 = bc%swf%Dc
+        data4 = bc%swf%C
+        data5 = bc%swf%T
+        data6 = bc%T0(1,:)
+        data7 = bc%T0(2,:)
+        data8 = bc%T0(3,:)
+     else
+        data1 = bc%rsf%V0
+        data2 = bc%rsf%f0
+        data3 = bc%rsf%a
+        data4 = bc%rsf%b
+        data5 = bc%rsf%L
+        data6 = bc%rsf%theta
+        data7 = bc%rsf%C
+        data8 = bc%rsf%T
+        data9 = bc%rsf%fw
+        data10= bc%rsf%Vw
+        data11= bc%T0(1,:)
+        data12= bc%T0(2,:)
+        data13= bc%T0(3,:)
+     endif
+  endif
+
+  npoin_all = 0
+  call sum_all_i(npoin,npoin_all)
+
+  if (myrank == 0 .and. npoin_all > 0) then
+     allocate(X_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(Y_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(Z_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data1_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data2_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data3_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data4_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data5_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data6_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data7_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data8_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data9_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data10_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data11_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data12_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+     allocate(data13_all(npoin_all),stat=ier)
+     if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+  endif
+           
+  allocate(npoin_perproc(NPROC),stat=ier)
+  if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+  allocate(poin_offset(NPROC),stat=ier)
+  if (ier /= 0) call exit_MPI_without_rank('error allocating array 11111')
+  npoin_perproc=0
+  call gather_all_singlei(bc%nglob, npoin_perproc, NPROC)
+  poin_offset(1)=0
+  do iproc=2,NPROC
+     poin_offset(iproc) = sum(npoin_perproc(1:iproc-1))
+  enddo
+     
+  call gatherv_all_cr(X,bc%nglob,X_all,npoin_perproc,poin_offset,npoin,NPROC)
+  call gatherv_all_cr(Y,bc%nglob,Y_all,npoin_perproc,poin_offset,npoin,NPROC)
+  call gatherv_all_cr(Z,bc%nglob,Z_all,npoin_perproc,poin_offset,npoin,NPROC)
+  if(.not. RATE_AND_STATE) then
+     call gatherv_all_cr(data1,bc%nglob,data1_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data2,bc%nglob,data2_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data3,bc%nglob,data3_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data4,bc%nglob,data4_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data5,bc%nglob,data5_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data6,bc%nglob,data6_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data7,bc%nglob,data7_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data8,bc%nglob,data8_all,npoin_perproc,poin_offset,npoin,NPROC)
+  else
+     call gatherv_all_cr(data1,bc%nglob,data1_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data2,bc%nglob,data2_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data3,bc%nglob,data3_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data4,bc%nglob,data4_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data5,bc%nglob,data5_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data6,bc%nglob,data6_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data7,bc%nglob,data7_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data8,bc%nglob,data8_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data9,bc%nglob,data9_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data10,bc%nglob,data10_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data11,bc%nglob,data11_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data12,bc%nglob,data12_all,npoin_perproc,poin_offset,npoin,NPROC)
+     call gatherv_all_cr(data13,bc%nglob,data13_all,npoin_perproc,poin_offset,npoin,NPROC)
+  endif
+
+  ! Write the fault info by myrank == 0
+  if(.not. RATE_AND_STATE .and. myrank == 0) then
+     open(IOUT,file=trim(filename),status='replace')
+     write(*,*) '   Write fault input data: slip-weakening/time-weakening friction.'
+     write(IOUT,*) 'X Y Z mus mud Dc Tau1 Tau2 Tau3'
+     do i=1,npoin_all
+        write(IOUT,'(9(E15.7))') X_all(i),Y_all(i),Z_all(i),&
+        data1_all(i), data2_all(i), data3_all(i), data6_all(i), data7_all(i), data8_all(i)
+     enddo
+
+  else if (RATE_AND_STATE .and. myrank == 0) then
+     open(IOUT,file=trim(filename),status='replace')
+     write(*,*) '   Write fault input data: rate-and-state friction.'
+     write(IOUT,*) 'X Y Z V0 f0 a b L V_init theta fw Vw Tau1 Tau2 Tau3'
+     do i=1,npoin_all
+        write(IOUT,'(14(E15.7))')X_all(i), Y_all(i),Z_all(i),&
+        data1_all(i), data2_all(i), data3_all(i), data4_all(i), data5_all(i), data6_all(i), &
+        data9_all(i), data10_all(i), data11_all(i), data12_all(i),data13_all(i)
+     enddo
+  endif
+
+  close(IOUT)
+
+end subroutine Write_input_fault_info
+
+!--------------
 
 subroutine SCEC_Write_RuptureTime(dataXZ,iflt)
 
@@ -1518,7 +1764,7 @@ subroutine SCEC_Write_RuptureTime(dataXZ,iflt)
 
 end subroutine SCEC_Write_RuptureTime
 
-!---------------------------------------------------------------
+!--------------
 
 subroutine init_dataXZ(dataXZ,bc)
 
