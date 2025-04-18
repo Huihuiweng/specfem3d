@@ -1953,6 +1953,7 @@ contains
 
   read(IIN_PAR, nml=TWF,iostat=ier)
   if (ier /= 0) write(*,*) 'TWF not found in Par_file_faults.'
+  if (mus-mud == 0) write(*,*) 'mus and mud is not defined for TWF in Par_file_faults.'
 
   f%nuc_x  = nuc_x
   f%nuc_y  = nuc_y

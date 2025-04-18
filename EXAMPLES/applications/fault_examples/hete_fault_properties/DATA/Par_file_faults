@@ -15,5 +15,5 @@
 &DIST2D shapeval='read-from-file', filename='initial_stress.dat' /
 &SWF mus=10000e0, nmus=1, mud=0.54e0, dc=6.79061e-01/
 &DIST2D shapeval='rectangle', val=0.63e0, xc=0e0, yc=0e0, zc=-7500.0e0, lx=18000.0e0, ly=1.0e0, lz=15000.0e0/
-&TWF nuc_x=0.0, nuc_y=0.0, nuc_z=-7500.0, nuc_r=4.00000e+04, nuc_t0=0.5, nuc_v=3.33000e+02/
+&TWF nuc_x=0.0, nuc_y=0.0, nuc_z=-7500.0, nuc_r=4.00000e+04, nuc_t0=0.5, nuc_v=3.33000e+02,mus=0.63e0,mud=0.54e0/
 
